@@ -21,8 +21,10 @@ type countingServerClient struct {
 	listCalls int
 	getCalls  int
 	listErr   error
-	// listGate, when set, blocks every list until it is closed.
+	getErr    error
+	// listGate and getGate, when set, block every list or get until closed.
 	listGate chan struct{}
+	getGate  chan struct{}
 }
 
 func newCountingServerClient(servers ...*hcloud.Server) *countingServerClient {
@@ -41,10 +43,23 @@ func (c *countingServerClient) DeleteWithResult(context.Context, *hcloud.Server)
 	return nil, nil, errors.New("not used")
 }
 
-func (c *countingServerClient) GetByID(_ context.Context, id int64) (*hcloud.Server, *hcloud.Response, error) {
+func (c *countingServerClient) GetByID(ctx context.Context, id int64) (*hcloud.Server, *hcloud.Response, error) {
+	c.mu.Lock()
+	c.getCalls++
+	gate, err := c.getGate, c.getErr
+	c.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.getCalls++
 	return c.servers[id], nil, nil
 }
 
@@ -90,6 +105,28 @@ func (c *countingServerClient) setListErr(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.listErr = err
+}
+
+func (c *countingServerClient) setGetErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.getErr = err
+}
+
+// waitForCounts blocks until at least list lists and get gets have started.
+func (c *countingServerClient) waitForCounts(t *testing.T, list, get int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		l, g := c.counts()
+		if l >= list && g >= get {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d lists and %d gets, have %d and %d", list, get, l, g)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 type fakeClock struct {
@@ -355,5 +392,157 @@ func TestGetForDrift_InvalidProviderID(t *testing.T) {
 	p, _ := newSnapshotProvider(newCountingServerClient())
 	if _, err := p.GetForDrift(context.Background(), "aws:///i-123"); err == nil {
 		t.Fatal("want a parse error")
+	}
+}
+
+// A failed live lookup of an ID missing from the list backs off like a failed refresh,
+// keeps returning its error meanwhile, and recovers after the retry time (#127 review).
+func TestGetForDrift_FailedLookupBacksOff(t *testing.T) {
+	client := newCountingServerClient(managedServer(1, 1))
+	rateLimited := hcloud.Error{Code: hcloud.ErrorCodeRateLimitExceeded, Message: "limit reached"}
+	client.setGetErr(rateLimited)
+	p, clock := newSnapshotProvider(client)
+	ctx := context.Background()
+
+	for i := 0; i < 100; i++ {
+		if _, err := p.GetForDrift(ctx, FormatProviderID(99)); !hcloud.IsError(err, hcloud.ErrorCodeRateLimitExceeded) {
+			t.Fatalf("call %d: want the rate-limit error, got %v", i, err)
+		}
+	}
+	if list, get := client.counts(); list != 1 || get != 1 {
+		t.Fatalf("100 failed lookups of one ID within the backoff: want 1 list and 1 get, got %d and %d", list, get)
+	}
+
+	clock.Advance(snapshotBackoffMin) // first backoff over: retry, fail again
+	_, _ = p.GetForDrift(ctx, FormatProviderID(99))
+	clock.Advance(snapshotBackoffMin) // the second backoff is twice as long: no request
+	_, _ = p.GetForDrift(ctx, FormatProviderID(99))
+	if _, get := client.counts(); get != 2 {
+		t.Fatalf("second lookup backoff must double: want 2 gets, got %d", get)
+	}
+
+	// Backoff keeps doubling: 10 s, then 20 s, then 40 s, the last one past the
+	// refresh at one minute.
+	clock.Advance(snapshotBackoffMin) // t=15s: retry, fail
+	_, _ = p.GetForDrift(ctx, FormatProviderID(99))
+	clock.Advance(4 * snapshotBackoffMin) // t=35s: retry, fail; next retry at t=75s
+	_, _ = p.GetForDrift(ctx, FormatProviderID(99))
+	if _, get := client.counts(); get != 4 {
+		t.Fatalf("want 4 gets after four backoff steps, got %d", get)
+	}
+
+	// A refresh in between does not reset the lookup's backoff.
+	clock.Advance(DefaultSnapshotTTL - 7*snapshotBackoffMin) // t=60s
+	if _, err := p.GetForDrift(ctx, FormatProviderID(99)); !hcloud.IsError(err, hcloud.ErrorCodeRateLimitExceeded) {
+		t.Fatalf("after a refresh the lookup must still back off, got %v", err)
+	}
+	if list, get := client.counts(); list != 2 || get != 4 {
+		t.Fatalf("want 2 lists and still 4 gets, got %d and %d", list, get)
+	}
+
+	client.setGetErr(nil)
+	clock.Advance(3 * snapshotBackoffMin) // t=75s
+	for i := 0; i < 10; i++ {
+		if s, err := p.GetForDrift(ctx, FormatProviderID(99)); err != nil || s != nil {
+			t.Fatalf("after the backoff the lookup must recover to not-found: %+v, %v", s, err)
+		}
+	}
+	if _, get := client.counts(); get != 5 {
+		t.Errorf("a recovered lookup is reused until the next refresh: want 5 gets, got %d", get)
+	}
+}
+
+// Concurrent checks of one missing ID share a single GET, and a waiter that gives up
+// does not cancel it for the others (#127 review).
+func TestGetForDrift_ConcurrentMissingLookupsShareOneGet(t *testing.T) {
+	unlabelled := &hcloud.Server{ID: 7}
+	client := newCountingServerClient(managedServer(1, 1), unlabelled)
+	p, _ := newSnapshotProvider(client)
+	if _, err := p.GetForDrift(context.Background(), FormatProviderID(1)); err != nil {
+		t.Fatal(err)
+	}
+	client.getGate = make(chan struct{})
+
+	cctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := p.GetForDrift(cctx, FormatProviderID(7))
+		first <- err
+	}()
+	client.waitForCounts(t, 1, 1)
+
+	const callers = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := p.GetForDrift(context.Background(), FormatProviderID(7))
+			if err == nil && (s == nil || s.ID != 7) {
+				err = errors.New("wrong server")
+			}
+			errs <- err
+		}()
+	}
+	cancel()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled waiter: want context.Canceled, got %v", err)
+	}
+	time.Sleep(20 * time.Millisecond) // let the other callers join the lookup
+	close(client.getGate)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if list, get := client.counts(); list != 1 || get != 1 {
+		t.Errorf("want 1 list and 1 get for %d concurrent lookups of one ID, got %d and %d", callers+1, list, get)
+	}
+}
+
+// While refreshes keep failing, the previous copy is served only up to snapshotMaxAge;
+// beyond it checks return the refresh error, and the first good refresh recovers
+// (#127 review).
+func TestGetForDrift_StaleCopyHasMaximumAge(t *testing.T) {
+	client := newCountingServerClient(managedServer(1, 1))
+	p, clock := newSnapshotProvider(client)
+	ctx := context.Background()
+	if _, err := p.GetForDrift(ctx, FormatProviderID(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	outage := errors.New("503")
+	client.setListErr(outage)
+	start := clock.Now()
+	for clock.Now().Sub(start) < snapshotMaxAge-time.Second {
+		clock.Advance(time.Second)
+		if s, err := p.GetForDrift(ctx, FormatProviderID(1)); err != nil || s == nil {
+			t.Fatalf("copy %s old must still be served: %+v, %v", clock.Now().Sub(start), s, err)
+		}
+	}
+	clock.Advance(time.Second)
+	for i := 0; i < 10; i++ {
+		if s, err := p.GetForDrift(ctx, FormatProviderID(1)); !errors.Is(err, outage) || s != nil {
+			t.Fatalf("copy at the maximum age must not be served: %+v, %v", s, err)
+		}
+	}
+	clock.Advance(24 * time.Hour)
+	if _, err := p.GetForDrift(ctx, FormatProviderID(1)); !errors.Is(err, outage) {
+		t.Fatalf("a day-old copy must not be served, got %v", err)
+	}
+	// Backoff still bounds the requests: about one list per backoff step, not per check.
+	if list, _ := client.counts(); list > 12 {
+		t.Errorf("failed refreshes must back off: want at most 12 lists, got %d", list)
+	}
+
+	client.setListErr(nil)
+	client.set(managedServer(1, 2))
+	clock.Advance(snapshotBackoffMax)
+	s, err := p.GetForDrift(ctx, FormatProviderID(1))
+	if err != nil || s == nil || s.PrivateNet[0].Network.ID != 2 {
+		t.Fatalf("the first good refresh must recover with current data: %+v, %v", s, err)
 	}
 }
